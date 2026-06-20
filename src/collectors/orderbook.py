@@ -13,7 +13,8 @@ skipped.
 Output
 ------
 One gzipped CSV per asset per UTC day, appended once per snapshot:
-``{data_dir}/{ASSET}/{YYYYMMDD}.csv.gz`` (default ``data/binance/order_book/``).
+``{data_dir}/{ASSET}_{QUOTE}/{YYYYMMDD}.csv.gz`` (e.g. ``BTC_USDT/...``;
+default ``data/binance/order_book/``).
 Appends produce a valid multi-member gzip that pandas/zcat read transparently,
 and the file rolls over automatically at midnight UTC.
 
@@ -187,12 +188,21 @@ class OrderBookCollector:
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
-    def _csv_path(self, asset: str, day: str) -> Path:
-        """Daily gzipped CSV for one asset: ``{data_dir}/{ASSET}/{YYYYMMDD}.csv.gz``."""
-        return self._data_dir / _safe_code(asset) / f"{day}.csv.gz"
+    def _folder_name(self, asset: str, symbol: str) -> str:
+        """``{ASSET}_{QUOTE}`` directory name, e.g. ``BTC_USDT``.
 
-    def _append_row(self, asset: str, row: dict, day: str) -> None:
-        path = self._csv_path(asset, day)
+        The quote currency is taken from the resolved Binance ``symbol``
+        (``BASE/QUOTE``), falling back to the collector's configured quote.
+        """
+        quote = symbol.split("/")[-1] if "/" in symbol else self.quote
+        return f"{_safe_code(asset)}_{_safe_code(quote)}"
+
+    def _csv_path(self, asset: str, symbol: str, day: str) -> Path:
+        """Daily gzipped CSV: ``{data_dir}/{ASSET}_{QUOTE}/{YYYYMMDD}.csv.gz``."""
+        return self._data_dir / self._folder_name(asset, symbol) / f"{day}.csv.gz"
+
+    def _append_row(self, asset: str, symbol: str, row: dict, day: str) -> None:
+        path = self._csv_path(asset, symbol, day)
         path.parent.mkdir(parents=True, exist_ok=True)
         frame = pd.DataFrame([row]).reindex(columns=self.columns)
         write_header = not path.exists()
@@ -226,7 +236,7 @@ class OrderBookCollector:
             try:
                 book = self.binance.fetch_order_book(symbol, limit=self._book_limit)
                 row = _features_from_book(book, asset, symbol, ts, self.depth)
-                self._append_row(asset, row, day)
+                self._append_row(asset, symbol, row, day)
                 rows.append(row)
             except Exception:  # noqa: BLE001 — one bad symbol must not abort the pass
                 logger.exception("Order-book snapshot failed for %s (%s)", asset, symbol)

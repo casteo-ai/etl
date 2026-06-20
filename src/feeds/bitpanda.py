@@ -29,8 +29,10 @@ minimal loader is built in). One Trading uses an API key only (no secret).
 
 from __future__ import annotations
 
+import json
 import os
-from datetime import datetime, timezone
+import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -52,6 +54,15 @@ _PAGE = 1000            # candles requested per window (One Trading default cap 
 _FLUSH_SIZE = 10_000    # persist to CSV every N candles during a large fetch
 
 _ORDER_BOOK_COLUMNS = ["timestamp", "symbol", "side", "level", "price", "amount"]
+
+# Listed assets change rarely; the tradeable-asset query is cached this long.
+_ASSETS_CACHE_TTL = timedelta(hours=24)
+
+# Bitpanda's full tradeable universe (crypto, metals, stocks, ETFs, indices) is
+# served by the broker public API, NOT the One Trading exchange CCXT wraps. This
+# JSON:API endpoint is paginated (~14k assets).
+_ASSETS_URL = "https://api.bitpanda.com/v2/assets"
+_ASSETS_PAGE_SIZE = 500
 
 
 def _to_ms(t: Union[str, datetime, int, float, pd.Timestamp]) -> int:
@@ -134,6 +145,10 @@ class BitpandaClient:
         self._csv_last_ts: dict[tuple[str, str], pd.Timestamp] = {}
         self._csv_needs_trim: dict[tuple[str, str], bool] = {}
 
+        # 24h cache for the tradeable-asset list (see ``tradeable_assets``).
+        self._assets_cache: Optional[pd.DataFrame] = None
+        self._assets_fetched_at: Optional[datetime] = None
+
     # ------------------------------------------------------------------
     # Instruments / assets
     # ------------------------------------------------------------------
@@ -159,10 +174,77 @@ class BitpandaClient:
         return pd.DataFrame(results)
 
     def list_assets(self, reload: bool = False) -> pd.DataFrame:
-        """Single-column (``asset``) DataFrame of unique active base assets."""
+        """Base assets with a tradeable market on the **One Trading exchange**.
+
+        This is the small set of crypto pairs CCXT exposes (those for which
+        ``fetch_ohlcv`` / ``fetch_order_book`` work). For the full Bitpanda
+        tradeable universe use :meth:`tradeable_assets`.
+
+        Returns a single-column (``asset``) DataFrame of unique active base
+        assets, sorted alphabetically.
+        """
         markets = self.exchange.load_markets(reload)
         assets = sorted({m["base"] for m in markets.values() if m.get("active") is not False})
         return pd.DataFrame(assets, columns=["asset"])
+
+    def _get_json(self, url: str, timeout: float = 30.0) -> dict:
+        """HTTP GET returning parsed JSON (overridable for tests)."""
+        req = urllib.request.Request(url, headers={"User-Agent": "etl-bitpanda-client"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+
+    def _fetch_asset_universe(self) -> pd.DataFrame:
+        """Page through Bitpanda's public ``/v2/assets`` endpoint (~14k assets)."""
+        rows: list[dict] = []
+        total: Optional[int] = None
+        page = 1
+        while True:
+            url = f"{_ASSETS_URL}?page[size]={_ASSETS_PAGE_SIZE}&page[number]={page}"
+            payload = self._get_json(url)
+            batch = payload.get("data") or []
+            for item in batch:
+                attrs = item.get("attributes") or {}
+                rows.append({
+                    "asset": attrs.get("symbol"),
+                    "name": attrs.get("name"),
+                    "id": item.get("id"),
+                })
+            meta = payload.get("meta") or {}
+            total = meta.get("total_count", total)
+            has_next = bool((payload.get("links") or {}).get("next"))
+            if not batch or not has_next or (total is not None and len(rows) >= total):
+                break
+            page += 1
+
+        df = pd.DataFrame(rows, columns=["asset", "name", "id"])
+        if not df.empty:
+            df = df.sort_values(["asset", "name"], na_position="last").reset_index(drop=True)
+        return df
+
+    def tradeable_assets(self, reload: bool = False) -> pd.DataFrame:
+        """The **entire** Bitpanda tradeable universe — cached for 24 hours.
+
+        Pulled from Bitpanda's broker public API (``/v2/assets``), this covers
+        every tradeable asset class — crypto, metals, stocks, ETFs, indices —
+        i.e. thousands of assets, not just the handful of crypto pairs on the
+        One Trading exchange. The set changes rarely, so the answer is cached
+        for 24 hours; pass ``reload=True`` to force a refresh.
+
+        Returns
+        -------
+        DataFrame with columns ``asset`` (ticker symbol), ``name`` and ``id``,
+        sorted by symbol.
+        """
+        now = datetime.now(timezone.utc)
+        fresh = (
+            self._assets_cache is not None
+            and self._assets_fetched_at is not None
+            and now - self._assets_fetched_at < _ASSETS_CACHE_TTL
+        )
+        if reload or not fresh:
+            self._assets_cache = self._fetch_asset_universe()
+            self._assets_fetched_at = now
+        return self._assets_cache.copy()
 
     # ------------------------------------------------------------------
     # CSV helpers

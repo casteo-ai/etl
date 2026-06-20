@@ -149,6 +149,207 @@ class TestCsvPath:
         assert path.name == "BTC_USDT_1m.csv"
 
 
+class TestDailyGzipPersistence:
+    def test_archive_url_uses_binance_symbol_format(self, client):
+        url = client._archive_url("BTC/USDC", "1m", pd.Timestamp("2025-01-01", tz="UTC"))
+        assert url.endswith("/BTCUSDC/1m/BTCUSDC-1m-2025-01-01.zip")
+
+    def test_monthly_archive_url_uses_binance_symbol_format(self, client):
+        url = client._monthly_archive_url("BTC/USDC", "1m", pd.Timestamp("2025-01-01", tz="UTC"))
+        assert url.endswith("/BTCUSDC/1m/BTCUSDC-1m-2025-01.zip")
+
+    def test_archive_csv_to_df_normalises_microsecond_timestamps(self, client):
+        payload = (
+            "1735689600000000,4.15070000,4.15870000,4.15060000,4.15540000,"
+            "539.23000000,1735689659999999,2240.39860900,13,401.82000000,1669.98121300,0\n"
+        ).encode()
+        out = client._archive_csv_to_df(payload)
+        assert out.index[0] == pd.Timestamp("2025-01-01 00:00:00", tz="UTC")
+        assert out.iloc[0]["close_time"] == pd.Timestamp("2025-01-01 00:00:59.999999", tz="UTC")
+        assert out.iloc[0]["num_trades"] == 13
+
+    def test_fetch_ohlcv_monthly_gzip_splits_archive_into_daily_files(self, client, tmp_path, monkeypatch):
+        jan1 = client._rows_to_df(make_kline_rows(T0, 2))
+        jan2 = client._rows_to_df(make_kline_rows(T0 + 24 * 60 * STEP_MS, 2))
+        monthly = pd.concat([jan1, jan2])
+
+        def fake_monthly(symbol, timeframe, month_start, month_end):
+            assert symbol == "BTC/USDC"
+            assert timeframe == "1m"
+            assert month_start == pd.Timestamp("2025-01-01", tz="UTC")
+            return monthly.copy(), "ok"
+
+        monkeypatch.setattr(client, "_fetch_monthly_archive_klines", fake_monthly)
+
+        result = client.fetch_ohlcv_monthly_gzip(
+            "BTC/USDC",
+            month="2025-01-01",
+            data_dir=tmp_path,
+        )
+
+        assert result["status"] == "ok"
+        assert result["rows"] == 4
+        assert sorted(result["written_days"]) == ["2025-01-01", "2025-01-02"]
+        assert (tmp_path / "BTC_USDC" / "20250101.csv.gz").exists()
+        assert (tmp_path / "BTC_USDC" / "20250102.csv.gz").exists()
+
+    def test_fetch_ohlcv_daily_gzip_uses_bulk_archive_for_full_historical_day(self, client, tmp_path, monkeypatch):
+        full = client._rows_to_df(make_kline_rows(T0, 5))
+        archive_calls = []
+
+        def fake_archive(symbol, timeframe, range_start, range_end):
+            archive_calls.append((symbol, timeframe, range_start, range_end))
+            return full.copy()
+
+        monkeypatch.setattr(client, "_fetch_archive_klines", fake_archive)
+        monkeypatch.setattr(
+            client,
+            "_fetch_raw_klines",
+            lambda *args, **kwargs: pytest.fail("API pagination should not be used"),
+        )
+
+        out = client.fetch_ohlcv_daily_gzip(
+            "BTC/USDC",
+            day="2025-01-01",
+            data_dir=tmp_path,
+            verbose=False,
+        )
+
+        path = tmp_path / "BTC_USDC" / "20250101.csv.gz"
+        assert path.exists()
+        assert len(out) == 5
+        assert archive_calls == [
+            (
+                "BTC/USDC",
+                "1m",
+                pd.Timestamp("2025-01-01", tz="UTC"),
+                pd.Timestamp("2025-01-02", tz="UTC"),
+            )
+        ]
+
+    def test_fetch_ohlcv_daily_gzip_falls_back_to_api_when_archive_missing(self, client, tmp_path, monkeypatch):
+        full = client._rows_to_df(make_kline_rows(T0, 5))
+        calls = []
+        monkeypatch.setattr(client, "_fetch_archive_klines", lambda *args, **kwargs: None)
+
+        def fake_fetch(symbol, timeframe, since_ms, until_ms, verbose=True):
+            calls.append((symbol, timeframe, since_ms, until_ms, verbose))
+            return full.copy()
+
+        monkeypatch.setattr(client, "_fetch_raw_klines", fake_fetch)
+
+        out = client.fetch_ohlcv_daily_gzip(
+            "BTC/USDC",
+            day="2025-01-01",
+            data_dir=tmp_path,
+            verbose=False,
+        )
+
+        assert len(out) == 5
+        assert calls == [
+            (
+                "BTC/USDC",
+                "1m",
+                _to_ms(pd.Timestamp("2025-01-01", tz="UTC")),
+                _to_ms(pd.Timestamp("2025-01-02", tz="UTC")),
+                False,
+            )
+        ]
+
+    def test_fetch_ohlcv_daily_gzip_only_downloads_missing_tail(self, client, tmp_path, monkeypatch):
+        existing = client._rows_to_df(make_kline_rows(T0, 2))
+        path = tmp_path / "BTC_USDC" / "20250101.csv.gz"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing.to_csv(path, compression="gzip")
+
+        missing = client._rows_to_df(make_kline_rows(T0 + 2 * STEP_MS, 3))
+        calls = []
+
+        def fake_fetch(symbol, timeframe, since_ms, until_ms, verbose=True):
+            calls.append((symbol, timeframe, since_ms, until_ms, verbose))
+            return missing.copy()
+
+        monkeypatch.setattr(client, "_fetch_raw_klines", fake_fetch)
+
+        out = client.fetch_ohlcv_daily_gzip(
+            "BTC/USDC",
+            day="2025-01-01",
+            until=pd.Timestamp(T0 + 5 * STEP_MS, unit="ms", tz="UTC"),
+            data_dir=tmp_path,
+            verbose=False,
+        )
+
+        assert calls == [
+            (
+                "BTC/USDC",
+                "1m",
+                T0 + 2 * STEP_MS,
+                T0 + 5 * STEP_MS,
+                False,
+            )
+        ]
+        assert out.attrs["downloaded_rows"] == 3
+        assert len(pd.read_csv(path)) == 5
+
+    def test_fetch_ohlcv_daily_gzip_downloads_internal_gap_only(self, client, tmp_path, monkeypatch):
+        existing = client._rows_to_df(make_kline_rows(T0, 5)).drop(
+            pd.Timestamp(T0 + 2 * STEP_MS, unit="ms", tz="UTC")
+        )
+        path = tmp_path / "BTC_USDC" / "20250101.csv.gz"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing.to_csv(path, compression="gzip")
+
+        missing = client._rows_to_df(make_kline_rows(T0 + 2 * STEP_MS, 1))
+        calls = []
+
+        def fake_fetch(symbol, timeframe, since_ms, until_ms, verbose=True):
+            calls.append((symbol, timeframe, since_ms, until_ms, verbose))
+            return missing.copy()
+
+        monkeypatch.setattr(client, "_fetch_raw_klines", fake_fetch)
+
+        out = client.fetch_ohlcv_daily_gzip(
+            "BTC/USDC",
+            day="2025-01-01",
+            until=pd.Timestamp(T0 + 5 * STEP_MS, unit="ms", tz="UTC"),
+            data_dir=tmp_path,
+            verbose=False,
+        )
+
+        assert calls == [
+            (
+                "BTC/USDC",
+                "1m",
+                T0 + 2 * STEP_MS,
+                T0 + 3 * STEP_MS,
+                False,
+            )
+        ]
+        assert out.attrs["downloaded_rows"] == 1
+        assert len(pd.read_csv(path)) == 5
+
+    def test_fetch_ohlcv_daily_gzip_does_not_download_complete_file(self, client, tmp_path, monkeypatch):
+        existing = client._rows_to_df(make_kline_rows(T0, 5))
+        path = tmp_path / "BTC_USDC" / "20250101.csv.gz"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing.to_csv(path, compression="gzip")
+
+        calls = []
+        monkeypatch.setattr(client, "_fetch_raw_klines", lambda *args, **kwargs: calls.append(args) or pd.DataFrame())
+
+        out = client.fetch_ohlcv_daily_gzip(
+            "BTC/USDC",
+            day="2025-01-01",
+            until=pd.Timestamp(T0 + 5 * STEP_MS, unit="ms", tz="UTC"),
+            data_dir=tmp_path,
+            verbose=False,
+        )
+
+        assert calls == []
+        assert out.attrs["downloaded_rows"] == 0
+        assert len(out) == 5
+
+
 class TestClearCache:
     def _seed(self, client):
         for key in (("BTC/USDT", "1m"), ("BTC/USDT", "1h"), ("ETH/USDT", "1m")):

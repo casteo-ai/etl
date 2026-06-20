@@ -31,3 +31,9 @@ Git history currently contains only `Initial commit`, so no detailed commit conv
 
 ## Security & Configuration Tips
 Read credentials from environment variables only. Do not commit API keys, generated market data, caches, or local IDE metadata. Prefer CSV for structured time series and JSON for unstructured records with metadata.
+
+## Date Format
+
+Dates as string should be in the format:
+- YYYYMMDD for date only 
+- YYYYMMDD_HHMMSS for date and time

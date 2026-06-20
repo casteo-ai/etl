@@ -70,46 +70,49 @@ class TestHelpers:
 
 
 # ---------------------------------------------------------------------------
-# age selection
+# age selection / local pruning
 # ---------------------------------------------------------------------------
 class TestAgeSelection:
-    def test_old_dated_file_archived(self, archiver, roots):
+    def test_old_dated_file_mirrored_and_pruned_locally(self, archiver, roots):
         src, nas = roots
         _write(src / "deribit/BTC_BTC/20260501.csv.gz", "old")  # 46 days < cutoff
         df = archiver.archive_once(now=NOW)
         assert (nas / "deribit/BTC_BTC/20260501.csv.gz").read_text() == "old"
         assert not (src / "deribit/BTC_BTC/20260501.csv.gz").exists()
-        assert df.loc[0, "status"] == "archived"
+        assert df.loc[0, "status"] == "copied+local-pruned"
 
-    def test_recent_dated_file_kept(self, archiver, roots):
+    def test_recent_dated_file_mirrored_and_kept_locally(self, archiver, roots):
         src, nas = roots
         _write(src / "deribit/BTC_BTC/20260616.csv.gz", "today")
         df = archiver.archive_once(now=NOW)
         assert (src / "deribit/BTC_BTC/20260616.csv.gz").exists()
-        assert not (nas / "deribit/BTC_BTC/20260616.csv.gz").exists()
-        assert df.empty
+        assert (nas / "deribit/BTC_BTC/20260616.csv.gz").read_text() == "today"
+        assert df.loc[0, "status"] == "copied"
 
-    def test_exactly_30_days_kept(self, archiver, roots):
-        src, _ = roots
+    def test_exactly_30_days_mirrored_and_kept_locally(self, archiver, roots):
+        src, nas = roots
         # cutoff = 2026-05-17; a file dated exactly on the cutoff is NOT older.
         _write(src / "deribit/X_Y/20260517.csv.gz", "edge")
         df = archiver.archive_once(now=NOW)
-        assert df.empty
+        assert df.loc[0, "status"] == "copied"
         assert (src / "deribit/X_Y/20260517.csv.gz").exists()
+        assert (nas / "deribit/X_Y/20260517.csv.gz").read_text() == "edge"
 
     def test_non_dated_uses_mtime_old(self, archiver, roots):
         src, nas = roots
         old = _write(src / "binance/BTC_USDT_1m.csv", "x", mtime=NOW - timedelta(days=40))
-        archiver.archive_once(now=NOW)
+        df = archiver.archive_once(now=NOW)
         assert (nas / "binance/BTC_USDT_1m.csv").exists()
         assert not old.exists()
+        assert df.loc[0, "status"] == "copied+local-pruned"
 
     def test_non_dated_uses_mtime_recent(self, archiver, roots):
         src, nas = roots
         _write(src / "binance/ETH_USDT_1m.csv", "x", mtime=NOW - timedelta(days=5))
-        archiver.archive_once(now=NOW)
+        df = archiver.archive_once(now=NOW)
         assert (src / "binance/ETH_USDT_1m.csv").exists()
-        assert not (nas / "binance/ETH_USDT_1m.csv").exists()
+        assert (nas / "binance/ETH_USDT_1m.csv").read_text() == "x"
+        assert df.loc[0, "status"] == "copied"
 
 
 # ---------------------------------------------------------------------------
@@ -142,16 +145,42 @@ class TestMirrorAndSafety:
         df = archiver.archive_once(dry_run=True, now=NOW)
         assert (src / "deribit/A_B/20260401.csv.gz").exists()
         assert not (nas / "deribit/A_B/20260401.csv.gz").exists()
-        assert df.loc[0, "status"] == "would-archive"
+        assert df.loc[0, "status"] == "would-copy+would-prune-local"
 
-    def test_already_archived_drops_local(self, archiver, roots):
+    def test_already_mirrored_old_file_drops_local(self, archiver, roots):
         src, nas = roots
         _write(src / "deribit/A_B/20260401.csv.gz", "same")
         _write(nas / "deribit/A_B/20260401.csv.gz", "same")  # identical already on NAS
         df = archiver.archive_once(now=NOW)
-        assert df.loc[0, "status"] == "already-archived"
+        assert df.loc[0, "status"] == "up-to-date+local-pruned"
         assert not (src / "deribit/A_B/20260401.csv.gz").exists()
         assert (nas / "deribit/A_B/20260401.csv.gz").read_text() == "same"
+
+    def test_newer_larger_local_replaces_nas(self, archiver, roots):
+        src, nas = roots
+        dest = _write(nas / "binance/BTC_USDT_1m.csv", "old", mtime=NOW - timedelta(hours=2))
+        _write(src / "binance/BTC_USDT_1m.csv", "new-larger", mtime=NOW)
+        df = archiver.archive_once(now=NOW)
+        assert df.loc[0, "status"] == "replaced"
+        assert dest.read_text() == "new-larger"
+        assert not (nas / "binance/BTC_USDT_1m.csv.bckp").exists()
+
+    def test_newer_smaller_local_backs_up_nas_before_replace(self, archiver, roots):
+        src, nas = roots
+        _write(nas / "binance/BTC_USDT_1m.csv", "old-larger", mtime=NOW - timedelta(hours=2))
+        _write(src / "binance/BTC_USDT_1m.csv", "new", mtime=NOW)
+        df = archiver.archive_once(now=NOW)
+        assert df.loc[0, "status"] == "backup-and-replaced"
+        assert (nas / "binance/BTC_USDT_1m.csv").read_text() == "new"
+        assert (nas / "binance/BTC_USDT_1m.csv.bckp").read_text() == "old-larger"
+
+    def test_older_local_does_not_replace_nas(self, archiver, roots):
+        src, nas = roots
+        _write(nas / "binance/BTC_USDT_1m.csv", "nas-newer", mtime=NOW)
+        _write(src / "binance/BTC_USDT_1m.csv", "local-old", mtime=NOW - timedelta(hours=2))
+        df = archiver.archive_once(now=NOW)
+        assert df.loc[0, "status"] == "nas-newer-or-same"
+        assert (nas / "binance/BTC_USDT_1m.csv").read_text() == "nas-newer"
 
     def test_empty_dirs_pruned(self, archiver, roots):
         src, _ = roots

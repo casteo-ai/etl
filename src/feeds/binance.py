@@ -8,7 +8,7 @@ Fetches klines (default 1-minute) with the full Binance extended field set:
 
 Persistence
 -----------
-Results are saved to CSV under ``data_dir`` (default ``/data/binance/``).
+Results are saved to CSV under ``data_dir`` (default ``data/binance/ohlcv/``).
 File names follow the pattern ``{SYMBOL}_{timeframe}.csv``
 (e.g. ``BTC_USDT_1m.csv``).  On every call the client:
   1. Loads the existing CSV into the in-memory cache if the cache is cold.
@@ -24,10 +24,15 @@ Credentials (only required for private/account endpoints):
 
 from __future__ import annotations
 
+import io
+import logging
 import os
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Union
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import pandas as pd
 
@@ -37,6 +42,8 @@ except ImportError as exc:
     raise ImportError("ccxt is required for the Binance client: pip install ccxt") from exc
 
 
+logger = logging.getLogger(__name__)
+
 _KLINE_COLUMNS = [
     "open_time", "open", "high", "low", "close", "volume",
     "close_time", "quote_volume", "num_trades",
@@ -45,6 +52,10 @@ _KLINE_COLUMNS = [
 
 _MAX_CANDLES = 1000          # Binance hard limit per request
 _FLUSH_SIZE  = 10_000        # persist to CSV every N candles during a large fetch
+_BINANCE_ARCHIVE_DAILY_URL = "https://data.binance.vision/data/spot/daily/klines"
+_BINANCE_ARCHIVE_MONTHLY_URL = "https://data.binance.vision/data/spot/monthly/klines"
+_ARCHIVE_TIMEOUT = 30
+_MICROSECOND_EPOCH_THRESHOLD = 10_000_000_000_000
 
 _ORDER_BOOK_COLUMNS = ["timestamp", "symbol", "side", "level", "price", "amount"]
 _FLOAT_COLS = (
@@ -52,6 +63,13 @@ _FLOAT_COLS = (
     "taker_buy_volume", "taker_buy_quote_volume",
     "taker_sell_volume", "taker_sell_quote_volume",
 )
+
+
+def _as_utc_timestamp(t: Union[str, datetime, pd.Timestamp]) -> pd.Timestamp:
+    ts = pd.Timestamp(t)
+    if ts.tzinfo is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
 
 
 def _to_ms(t: Union[str, datetime, int, float, pd.Timestamp]) -> int:
@@ -90,7 +108,7 @@ class BinanceClient:
         api_secret: Optional[str] = None,
         testnet: bool = False,
         enable_rate_limit: bool = True,
-        data_dir: Union[str, Path] = "/home/poucho/code/data/data/binance",
+        data_dir: Union[str, Path] = "/home/poucho/code/etl/data/binance/ohlcv",
     ) -> None:
         api_key = api_key or os.getenv("BINANCE_API_KEY")
         api_secret = api_secret or os.getenv("BINANCE_API_SECRET")
@@ -172,6 +190,234 @@ class BinanceClient:
     def _csv_path(self, symbol: str, timeframe: str) -> Path:
         safe = symbol.replace("/", "_")
         return self._data_dir / f"{safe}_{timeframe}.csv"
+
+    def _daily_ohlcv_path(
+        self,
+        symbol: str,
+        day: Union[str, datetime, pd.Timestamp],
+        data_dir: Optional[Union[str, Path]] = None,
+    ) -> Path:
+        safe = symbol.replace("/", "_")
+        root = Path(data_dir) if data_dir is not None else self._data_dir
+        return root / safe / f"{_as_utc_timestamp(day).strftime('%Y%m%d')}.csv.gz"
+
+    @staticmethod
+    def _archive_symbol(symbol: str) -> str:
+        """Binance archive symbol format: ``BTC/USDC`` -> ``BTCUSDC``."""
+        return symbol.replace("/", "").replace("_", "").upper()
+
+    def _archive_url(self, symbol: str, timeframe: str, day: pd.Timestamp) -> str:
+        archive_symbol = self._archive_symbol(symbol)
+        day_str = day.strftime("%Y-%m-%d")
+        return (
+            f"{_BINANCE_ARCHIVE_DAILY_URL}/{archive_symbol}/{timeframe}/"
+            f"{archive_symbol}-{timeframe}-{day_str}.zip"
+        )
+
+    def _monthly_archive_url(self, symbol: str, timeframe: str, month: pd.Timestamp) -> str:
+        archive_symbol = self._archive_symbol(symbol)
+        month_str = month.strftime("%Y-%m")
+        return (
+            f"{_BINANCE_ARCHIVE_MONTHLY_URL}/{archive_symbol}/{timeframe}/"
+            f"{archive_symbol}-{timeframe}-{month_str}.zip"
+        )
+
+    @staticmethod
+    def _archive_csv_to_df(payload: bytes) -> pd.DataFrame:
+        """Convert a Binance public archive CSV payload to the client OHLCV frame."""
+        df = pd.read_csv(io.BytesIO(payload), header=None, names=_KLINE_COLUMNS)
+        open_raw = pd.to_numeric(df["open_time"], errors="coerce")
+        df = df.loc[open_raw.notna()].copy()
+        if df.empty:
+            empty_cols = [c for c in _KLINE_COLUMNS if c != "_ignore"]
+            return pd.DataFrame(columns=empty_cols).set_index("open_time")
+
+        df["open_time"] = open_raw.loc[df.index].astype("int64")
+        close_raw = pd.to_numeric(df["close_time"], errors="coerce")
+        df["close_time"] = close_raw.loc[df.index].astype("int64")
+
+        open_unit = "us" if df["open_time"].abs().max() >= _MICROSECOND_EPOCH_THRESHOLD else "ms"
+        close_unit = "us" if df["close_time"].abs().max() >= _MICROSECOND_EPOCH_THRESHOLD else "ms"
+        df["open_time"] = pd.to_datetime(df["open_time"], unit=open_unit, utc=True)
+        df["close_time"] = pd.to_datetime(df["close_time"], unit=close_unit, utc=True)
+
+        for col in ("open", "high", "low", "close", "volume", "quote_volume",
+                    "taker_buy_volume", "taker_buy_quote_volume"):
+            df[col] = df[col].astype(float)
+        df["num_trades"] = df["num_trades"].astype(int)
+        df.drop(columns=["_ignore"], inplace=True)
+        df.set_index("open_time", inplace=True)
+        df.sort_index(inplace=True)
+        return df
+
+    def _should_try_bulk_archive(
+        self,
+        timeframe: str,
+        range_start: pd.Timestamp,
+        range_end: pd.Timestamp,
+    ) -> bool:
+        """Use the public archive only when it should beat API pagination."""
+        full_day = (
+            range_start == range_start.floor("D")
+            and range_end == range_start + pd.Timedelta(days=1)
+        )
+        if not full_day:
+            return False
+
+        # Daily archive files are published after the UTC day has completed.
+        if range_end > pd.Timestamp.now("UTC").floor("D"):
+            return False
+
+        step_ms = self.exchange.parse_timeframe(timeframe) * 1000
+        candles = max(0, (_to_ms(range_end) - _to_ms(range_start)) // step_ms)
+        api_requests = (candles + _MAX_CANDLES - 1) // _MAX_CANDLES
+        return api_requests > 1
+
+    def _fetch_archive_klines(
+        self,
+        symbol: str,
+        timeframe: str,
+        range_start: pd.Timestamp,
+        range_end: pd.Timestamp,
+        timeout: int = _ARCHIVE_TIMEOUT,
+    ) -> Optional[pd.DataFrame]:
+        """Fetch one full UTC day from Binance's public ZIP archive, if present."""
+        url = self._archive_url(symbol, timeframe, range_start)
+        req = Request(url, headers={"User-Agent": "etl-binance-client"})
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                payload = resp.read()
+        except HTTPError as exc:
+            if exc.code == 404:
+                return None
+            logger.warning("Binance archive request failed for %s: HTTP %s", url, exc.code)
+            return None
+        except (OSError, URLError, TimeoutError) as exc:
+            logger.warning("Binance archive request failed for %s: %s", url, exc)
+            return None
+
+        try:
+            with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+                csv_names = [name for name in archive.namelist() if name.lower().endswith(".csv")]
+                if not csv_names:
+                    return None
+                with archive.open(csv_names[0]) as fh:
+                    data = self._archive_csv_to_df(fh.read())
+        except (OSError, zipfile.BadZipFile, ValueError) as exc:
+            logger.warning("Could not parse Binance archive %s: %s", url, exc)
+            return None
+
+        data = data.loc[(data.index >= range_start) & (data.index < range_end)].copy()
+        data.attrs["source"] = "bulk-archive"
+        return data
+
+    def _fetch_monthly_archive_klines(
+        self,
+        symbol: str,
+        timeframe: str,
+        month_start: pd.Timestamp,
+        month_end: pd.Timestamp,
+        timeout: int = _ARCHIVE_TIMEOUT,
+    ) -> tuple[Optional[pd.DataFrame], str]:
+        """Fetch one monthly Binance public ZIP archive.
+
+        Returns ``(frame, status)`` where status is ``ok``, ``missing`` for a
+        404 archive, or ``error`` for transient/request/parse failures.
+        """
+        url = self._monthly_archive_url(symbol, timeframe, month_start)
+        req = Request(url, headers={"User-Agent": "etl-binance-client"})
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                payload = resp.read()
+        except HTTPError as exc:
+            if exc.code == 404:
+                return None, "missing"
+            logger.warning("Binance monthly archive request failed for %s: HTTP %s", url, exc.code)
+            return None, "error"
+        except (OSError, URLError, TimeoutError) as exc:
+            logger.warning("Binance monthly archive request failed for %s: %s", url, exc)
+            return None, "error"
+
+        try:
+            with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+                csv_names = [name for name in archive.namelist() if name.lower().endswith(".csv")]
+                if not csv_names:
+                    return pd.DataFrame(), "ok"
+                with archive.open(csv_names[0]) as fh:
+                    data = self._archive_csv_to_df(fh.read())
+        except (OSError, zipfile.BadZipFile, ValueError) as exc:
+            logger.warning("Could not parse Binance monthly archive %s: %s", url, exc)
+            return None, "error"
+
+        data = data.loc[(data.index >= month_start) & (data.index < month_end)].copy()
+        data.attrs["source"] = "monthly-bulk-archive"
+        return data, "ok"
+
+    def fetch_ohlcv_monthly_gzip(
+        self,
+        symbol: str,
+        month: Union[str, datetime, pd.Timestamp],
+        *,
+        start: Optional[Union[str, datetime, pd.Timestamp]] = None,
+        until: Optional[Union[str, datetime, pd.Timestamp]] = None,
+        timeframe: str = "1m",
+        data_dir: Optional[Union[str, Path]] = None,
+        force: bool = False,
+    ) -> dict:
+        """Fetch one monthly public archive and split it into daily gzip files.
+
+        This is an archive-only fast path. ``status='missing'`` means Binance
+        does not publish that symbol/month archive, usually because the pair had
+        no data yet.
+        """
+        month_start = _as_utc_timestamp(month).replace(day=1).floor("D")
+        month_end = month_start + pd.DateOffset(months=1)
+        range_start = max(_as_utc_timestamp(start).floor("D"), month_start) if start is not None else month_start
+        range_end = min(_as_utc_timestamp(until), month_end) if until is not None else month_end
+        if range_start >= range_end:
+            return {"status": "empty", "rows": 0, "written_days": []}
+
+        data, status = self._fetch_monthly_archive_klines(symbol, timeframe, month_start, month_end)
+        if status != "ok":
+            return {"status": status, "rows": 0, "written_days": []}
+        if data is None or data.empty:
+            return {"status": "ok", "rows": 0, "written_days": []}
+
+        data = data.loc[(data.index >= range_start) & (data.index < range_end)]
+        written_days: list[str] = []
+        for day, day_frame in data.groupby(data.index.floor("D")):
+            if day_frame.empty:
+                continue
+            path = self._daily_ohlcv_path(symbol, day, data_dir=data_dir)
+            if path.exists() and not force:
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            day_frame = day_frame[~day_frame.index.duplicated(keep="last")].sort_index()
+            day_frame.to_csv(path, compression="gzip")
+            written_days.append(pd.Timestamp(day).strftime("%Y-%m-%d"))
+
+        return {"status": "ok", "rows": len(data), "written_days": written_days}
+
+    def _fetch_missing_ohlcv_range(
+        self,
+        symbol: str,
+        timeframe: str,
+        range_start: pd.Timestamp,
+        range_end: pd.Timestamp,
+        verbose: bool,
+    ) -> pd.DataFrame:
+        if self._should_try_bulk_archive(timeframe, range_start, range_end):
+            archived = self._fetch_archive_klines(symbol, timeframe, range_start, range_end)
+            if archived is not None:
+                return archived
+
+        return self._fetch_raw_klines(
+            symbol=symbol,
+            timeframe=timeframe,
+            since_ms=_to_ms(range_start),
+            until_ms=_to_ms(range_end),
+            verbose=verbose,
+        )
 
     def _load_from_csv(self, symbol: str, timeframe: str) -> None:
         """
@@ -500,6 +746,81 @@ class BinanceClient:
         start_ts = pd.Timestamp(since_ms, unit="ms", tz="UTC")
         end_ts   = pd.Timestamp(until_ms, unit="ms", tz="UTC")
         return full.loc[(full.index >= start_ts) & (full.index < end_ts)].copy()
+
+    def fetch_ohlcv_daily_gzip(
+        self,
+        symbol: str,
+        day: Union[str, datetime, pd.Timestamp],
+        until: Optional[Union[str, datetime, pd.Timestamp]] = None,
+        timeframe: str = "1m",
+        data_dir: Optional[Union[str, Path]] = None,
+        force: bool = False,
+        verbose: bool = True,
+    ) -> pd.DataFrame:
+        """Fetch one UTC day of OHLCV and save it as ``BASE_QUOTE/YYYYMMDD.csv.gz``.
+
+        The output root defaults to this client's ``data_dir``. Empty days are
+        returned as empty DataFrames and do not create files, which covers pairs
+        that were not listed yet.
+        """
+        day_ts = _as_utc_timestamp(day).floor("D")
+        until_ts = _as_utc_timestamp(until) if until is not None else day_ts + pd.Timedelta(days=1)
+        end_ts = min(day_ts + pd.Timedelta(days=1), until_ts)
+        path = self._daily_ohlcv_path(symbol, day_ts, data_dir=data_dir)
+        existing = pd.DataFrame()
+
+        if path.exists() and not force:
+            existing = pd.read_csv(path, index_col="open_time")
+            existing.index = pd.to_datetime(existing.index, format="ISO8601", utc=True)
+            if "close_time" in existing.columns:
+                existing["close_time"] = pd.to_datetime(existing["close_time"], format="ISO8601", utc=True)
+            existing = existing[~existing.index.duplicated(keep="last")].sort_index()
+            existing = existing.loc[(existing.index >= day_ts) & (existing.index < end_ts)]
+
+        fetches: list[pd.DataFrame] = []
+        if existing.empty:
+            ranges = [(day_ts, end_ts)]
+        else:
+            step = pd.Timedelta(seconds=self.exchange.parse_timeframe(timeframe))
+            ranges = []
+            cursor = day_ts
+            for existing_ts in existing.index:
+                if existing_ts >= end_ts:
+                    break
+                if existing_ts > cursor:
+                    ranges.append((cursor, min(existing_ts, end_ts)))
+                cursor = max(cursor, existing_ts + step)
+                if cursor >= end_ts:
+                    break
+            if cursor < end_ts:
+                ranges.append((cursor, end_ts))
+
+        if not ranges and not force:
+            existing.attrs["downloaded_rows"] = 0
+            return existing
+
+        for range_start, range_end in ranges:
+            if range_start >= range_end:
+                continue
+            fetches.append(
+                self._fetch_missing_ohlcv_range(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    range_start=range_start,
+                    range_end=range_end,
+                    verbose=verbose,
+                )
+            )
+
+        downloaded_rows = sum(len(part) for part in fetches)
+        parts = [part for part in [existing, *fetches] if not part.empty]
+        data = pd.concat(parts).sort_index() if parts else pd.DataFrame()
+        if not data.empty:
+            data = data[~data.index.duplicated(keep="last")].sort_index()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data.to_csv(path, compression="gzip")
+        data.attrs["downloaded_rows"] = downloaded_rows
+        return data
 
     # ------------------------------------------------------------------
     # Level-2 order book

@@ -20,7 +20,7 @@ def test_main_builds_archiver_and_runs(monkeypatch):
             captured["dry_run"] = dry_run
             return pd.DataFrame(
                 [{"relative_path": "a", "size_bytes": 1, "source_path": "s",
-                  "dest_path": "d", "status": "archived"}]
+                  "dest_path": "d", "status": "copied"}]
             )
 
     monkeypatch.setattr(entry, "NasArchiver", FakeArchiver)

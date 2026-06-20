@@ -65,6 +65,12 @@ For example of contextual data:
 - entities
 - geography
 
+## Date Format
+
+Dates as string should be in the format:
+- YYYYMMDD for date only 
+- YYYYMMDD_HHMMSS for date and time
+
 ## Running tests
 
 ```bash
@@ -84,7 +90,7 @@ Wraps `ccxt.binance` for historical OHLCV klines with Binance's extended volume 
 
 - **Incremental CSV cache** — on first `fetch_ohlcv()` for a `(symbol, timeframe)` pair, any existing CSV is loaded into `_cache`. The last row is always dropped from cache (potentially incomplete candle) and the file is trimmed before the next write (`_csv_needs_trim`).
 - **Gap-filling** — only the missing window portions (before and/or after the cached range) are fetched from the API. Prepend triggers a full CSV rewrite; append flushes every `_FLUSH_SIZE` (10 000) candles incrementally so a timeout doesn't lose progress.
-- **Data dir** default: `/home/poucho/code/etl/data/binance/`; file pattern: `{SYMBOL}_{timeframe}.csv` (slashes in symbol become underscores).
+- **Data dir** default: `/home/poucho/code/etl/data/binance/ohlcv/`; file pattern: `{SYMBOL}_{timeframe}.csv` (slashes in symbol become underscores).
 
 Credentials (only for private/account endpoints):
 - `BINANCE_API_KEY`

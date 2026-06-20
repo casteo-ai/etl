@@ -141,11 +141,19 @@ class TestCollectOnce:
     def test_writes_one_gz_per_asset_per_day(self, collector, tmp_path):
         collector.collect_once(snapshot_time=TS)
         paths = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*.csv.gz"))
-        assert paths == ["BTC/20260616.csv.gz", "ETH/20260616.csv.gz"]
+        assert paths == ["BTC_USDT/20260616.csv.gz", "ETH_USDT/20260616.csv.gz"]
+
+    def test_folder_name_follows_quote(self, tmp_path):
+        markets = _markets("BTC/USDC")
+        binance = FakeBinance(markets, {"BTC/USDC": ([[1.0, 1.0]], [[2.0, 1.0]])})
+        col = OrderBookCollector(FakeDeribit(["BTC"]), binance, data_dir=tmp_path, depth=2, quote="USDC")
+        col.collect_once(snapshot_time=TS)
+        assert (tmp_path / "BTC_USDC" / "20260616.csv.gz").exists()
+        assert not (tmp_path / "BTC").exists()
 
     def test_row_schema_and_first_column(self, collector, tmp_path):
         collector.collect_once(snapshot_time=TS)
-        df = pd.read_csv(tmp_path / "BTC" / "20260616.csv.gz", parse_dates=["snapshot_time"])
+        df = pd.read_csv(tmp_path / "BTC_USDT" / "20260616.csv.gz", parse_dates=["snapshot_time"])
         assert list(df.columns) == collector.columns
         assert df.columns[0] == "snapshot_time"
         assert len(df) == 1
@@ -155,14 +163,14 @@ class TestCollectOnce:
     def test_appends_each_minute(self, collector, tmp_path):
         collector.collect_once(snapshot_time=TS)
         collector.collect_once(snapshot_time=TS + pd.Timedelta(minutes=1))
-        df = pd.read_csv(tmp_path / "BTC" / "20260616.csv.gz", parse_dates=["snapshot_time"])
+        df = pd.read_csv(tmp_path / "BTC_USDT" / "20260616.csv.gz", parse_dates=["snapshot_time"])
         assert len(df) == 2
         assert df["snapshot_time"].nunique() == 2  # no duplicate header row
 
     def test_rolls_over_by_utc_day(self, collector, tmp_path):
         collector.collect_once(snapshot_time=pd.Timestamp("2026-06-16 23:59:00", tz="UTC"))
         collector.collect_once(snapshot_time=pd.Timestamp("2026-06-17 00:00:00", tz="UTC"))
-        days = sorted(p.name for p in (tmp_path / "BTC").glob("*.csv.gz"))
+        days = sorted(p.name for p in (tmp_path / "BTC_USDT").glob("*.csv.gz"))
         assert days == ["20260616.csv.gz", "20260617.csv.gz"]
 
     def test_returns_combined_frame(self, collector):
@@ -177,8 +185,8 @@ class TestCollectOnce:
         col = OrderBookCollector(FakeDeribit(["BTC", "ETH"]), binance, data_dir=tmp_path, depth=2)
         out = col.collect_once(snapshot_time=TS)
         assert list(out["asset"]) == ["ETH"]  # BTC failed, ETH captured
-        assert (tmp_path / "ETH" / "20260616.csv.gz").exists()
-        assert not (tmp_path / "BTC").exists()
+        assert (tmp_path / "ETH_USDT" / "20260616.csv.gz").exists()
+        assert not (tmp_path / "BTC_USDT").exists()
 
     def test_close_propagates(self, collector):
         collector.close()

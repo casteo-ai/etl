@@ -189,3 +189,69 @@ class TestInstruments:
         df = client.list_assets()
         assert list(df["asset"]) == ["BTC", "ETH"]
         assert list(df.columns) == ["asset"]
+
+
+class TestTradeableAssets:
+    """tradeable_assets() pages the full Bitpanda /v2/assets universe (mocked)."""
+
+    def _paged_api(self, client):
+        """Two-page canned universe (total_count=3); counts page requests."""
+        calls = {"n": 0}
+
+        def fake_get(url, timeout=30.0):
+            calls["n"] += 1
+            if "page[number]=1" in url:
+                return {
+                    "data": [
+                        {"attributes": {"symbol": "ETH", "name": "Ether"}, "id": "2"},
+                        {"attributes": {"symbol": "BTC", "name": "Bitcoin"}, "id": "1"},
+                    ],
+                    "meta": {"total_count": 3},
+                    "links": {"next": "page2"},
+                }
+            return {
+                "data": [{"attributes": {"symbol": "ADA", "name": "Cardano"}, "id": "3"}],
+                "meta": {"total_count": 3},
+                "links": {"next": None},
+            }
+
+        client._get_json = fake_get
+        return calls
+
+    def test_returns_full_universe_sorted(self, client):
+        self._paged_api(client)
+        df = client.tradeable_assets()
+        assert list(df.columns) == ["asset", "name", "id"]
+        assert list(df["asset"]) == ["ADA", "BTC", "ETH"]  # all pages, sorted by symbol
+        assert df.loc[df.asset == "BTC", "name"].iloc[0] == "Bitcoin"
+
+    def test_paginates_until_total_reached(self, client):
+        calls = self._paged_api(client)
+        client.tradeable_assets()
+        assert calls["n"] == 2  # both pages fetched
+
+    def test_cached_within_24h(self, client):
+        calls = self._paged_api(client)
+        client.tradeable_assets()
+        client.tradeable_assets()
+        assert calls["n"] == 2  # second call served from cache (no extra page fetches)
+
+    def test_reload_forces_refresh(self, client):
+        calls = self._paged_api(client)
+        client.tradeable_assets()
+        client.tradeable_assets(reload=True)
+        assert calls["n"] == 4  # paged twice
+
+    def test_cache_expires_after_ttl(self, client):
+        from datetime import timedelta
+        calls = self._paged_api(client)
+        client.tradeable_assets()
+        client._assets_fetched_at -= timedelta(hours=25)
+        client.tradeable_assets()
+        assert calls["n"] == 4
+
+    def test_returns_copy_not_cache(self, client):
+        self._paged_api(client)
+        df = client.tradeable_assets()
+        df.loc[0, "asset"] = "MUTATED"
+        assert client.tradeable_assets().loc[0, "asset"] != "MUTATED"

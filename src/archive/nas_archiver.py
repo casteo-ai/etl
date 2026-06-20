@@ -1,25 +1,26 @@
 """
-NasArchiver — move data older than N days from local disk to a NAS mirror.
+NasArchiver — mirror local market data to NAS, then prune aged local files.
 
-Files under ``source_root`` (default ``/home/poucho/code/etl/data``) that are
-older than ``max_age_days`` (default 30) are copied to ``dest_root`` (default
-``/mnt/nas/market_data``) preserving the exact relative directory structure,
-verified, and only then deleted locally. The NAS is a *mirror* of the local
-tree: ``data/deribit/options/.../20260501.csv.gz`` →
+Every run scans files under ``source_root`` (default
+``/home/poucho/code/etl/data``) and mirrors new or updated local data into
+``dest_root`` (default ``/mnt/nas/market_data``), preserving the exact relative
+directory structure. The NAS is a durable mirror of the local tree:
+``data/deribit/options/.../20260501.csv.gz`` →
 ``market_data/deribit/options/.../20260501.csv.gz``.
 
 Design / safety
 ---------------
-* **Copy-verify-delete.** Each file is copied to a ``.partial`` temp name, the
-  copy is checksum-verified against the source (size + SHA-256), atomically
-  renamed into place, and only then removed locally. A crash at any point never
-  loses data and never leaves a truncated file that looks complete.
-* **Idempotent.** If the destination already exists and matches the source
-  checksum (e.g. a previous run copied it but didn't get to the delete), the
-  local copy is simply removed.
-* **Non-destructive to the NAS.** The archiver only ever writes the paths it
-  archives. It never deletes anything on the NAS, so unrelated folders
-  (``bitpanda``, ``crypto_archive``, ...) are left untouched.
+* **Copy-verify-promote.** Each file is copied to a ``.partial`` temp name,
+  checksum-verified against the source (size + SHA-256), then atomically
+  promoted into place. A crash never leaves a truncated file that looks
+  complete.
+* **Hourly mirror.** Missing NAS files are copied. Existing NAS files are
+  replaced only when the local file was modified later than the NAS copy.
+* **Backup on shrink.** If a newer local file is smaller than the NAS copy, the
+  current NAS file is first preserved as ``file.ext.bckp`` before replacement.
+  Existing distinct backups are never overwritten.
+* **Non-destructive to the NAS.** The archiver never deletes data from the NAS.
+  Old-file cleanup only removes verified local copies.
 * **Mount guard.** By default the run aborts unless ``dest_root`` sits on a real
   mountpoint, so a missing NAS mount can't cause files to be "archived" onto the
   local disk under ``/mnt`` and then deleted from their real location.
@@ -30,7 +31,7 @@ For the dated daily files (name is exactly ``YYYYMMDD`` before the extension,
 e.g. ``20260501.csv.gz``) the embedded date is used, so rewriting/recompressing
 a file doesn't reset its age. For everything else (e.g. Binance
 ``BTC_USDT_1m.csv``) the file mtime is used — which also means a file still being
-appended to today is never archived.
+appended to today is never pruned locally.
 """
 
 from __future__ import annotations
@@ -102,7 +103,7 @@ def _is_mounted(path: Path) -> bool:
 
 
 class NasArchiver:
-    """Move aged-out local data files to a mirrored NAS location.
+    """Mirror local data files to NAS and prune aged-out local copies.
 
     Parameters
     ----------
@@ -111,7 +112,8 @@ class NasArchiver:
     dest_root:
         NAS root to mirror into.
     max_age_days:
-        Files older than this are archived. Files exactly this old are kept.
+        Local files older than this are removed after the NAS copy is verified.
+        Files exactly this old are kept locally.
     require_mount:
         When True (default) abort if ``dest_root`` is not on a mountpoint.
     """
@@ -156,19 +158,10 @@ class NasArchiver:
         return _sha256(a) == _sha256(b)
 
     # ------------------------------------------------------------------
-    # Per-file move
+    # Per-file copy / backup
     # ------------------------------------------------------------------
-    def _archive_file(self, src: Path, dest: Path, dry_run: bool) -> str:
-        if dry_run:
-            return "would-archive"
-
+    def _copy_verified(self, src: Path, dest: Path) -> str:
         dest.parent.mkdir(parents=True, exist_ok=True)
-
-        # Already archived (verified) by an earlier run — just drop the local copy.
-        if dest.exists() and self._same_file(src, dest):
-            src.unlink()
-            return "already-archived"
-
         tmp = dest.with_name(dest.name + ".partial")
         try:
             shutil.copy2(src, tmp)  # preserves mtime/permissions
@@ -177,15 +170,86 @@ class NasArchiver:
                 return "verify-failed"
             os.replace(tmp, dest)  # atomic within the NAS filesystem
         except Exception:
-            # Never delete the source if the copy/verify didn't complete.
             try:
                 tmp.unlink(missing_ok=True)
             except OSError:
                 pass
             raise
+        return "copied"
 
+    def _backup_path(self, dest: Path) -> Path:
+        backup = dest.with_name(dest.name + ".bckp")
+        if not backup.exists():
+            return backup
+        if self._same_file(dest, backup):
+            return backup
+
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        candidate = dest.with_name(dest.name + f".bckp.{stamp}")
+        counter = 1
+        while candidate.exists():
+            candidate = dest.with_name(dest.name + f".bckp.{stamp}.{counter}")
+            counter += 1
+        return candidate
+
+    def _backup_nas_file(self, dest: Path) -> Path:
+        backup = self._backup_path(dest)
+        if backup.exists() and self._same_file(dest, backup):
+            return backup
+
+        tmp = backup.with_name(backup.name + ".partial")
+        try:
+            shutil.copy2(dest, tmp)
+            if not self._same_file(dest, tmp):
+                tmp.unlink(missing_ok=True)
+                raise RuntimeError(f"backup verification failed for {dest}")
+            os.replace(tmp, backup)
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        return backup
+
+    def _mirror_file(self, src: Path, dest: Path, dry_run: bool) -> str:
+        """Mirror one local file to NAS without deleting either side."""
+        if dest.exists() and self._same_file(src, dest):
+            return "up-to-date"
+
+        if not dest.exists():
+            if dry_run:
+                return "would-copy"
+            return self._copy_verified(src, dest)
+
+        src_stat = src.stat()
+        dest_stat = dest.stat()
+        if src_stat.st_mtime <= dest_stat.st_mtime:
+            return "nas-newer-or-same"
+
+        if dry_run:
+            return (
+                "would-backup-and-replace"
+                if src_stat.st_size < dest_stat.st_size
+                else "would-replace"
+            )
+
+        if src_stat.st_size < dest_stat.st_size:
+            self._backup_nas_file(dest)
+            status = self._copy_verified(src, dest)
+            return "backup-and-replaced" if status == "copied" else status
+
+        status = self._copy_verified(src, dest)
+        return "replaced" if status == "copied" else status
+
+    def _prune_local_file(self, src: Path, dest: Path, dry_run: bool) -> Optional[str]:
+        """Remove an old local file only when the NAS copy is verified identical."""
+        if not dest.exists() or not self._same_file(src, dest):
+            return "local-prune-skipped"
+        if dry_run:
+            return "would-prune-local"
         src.unlink()
-        return "archived"
+        return "local-pruned"
 
     # ------------------------------------------------------------------
     # Empty-dir cleanup
@@ -208,14 +272,14 @@ class NasArchiver:
     def archive_once(
         self, dry_run: bool = False, now: Optional[datetime] = None
     ) -> pd.DataFrame:
-        """Archive every aged-out file once.
+        """Mirror local files to NAS and prune aged-out verified local copies.
 
         Returns
         -------
-        Manifest DataFrame (one row per candidate file) with columns
+        Manifest DataFrame (one row per local file) with columns
         ``relative_path, size_bytes, source_path, dest_path, status``. ``status``
-        is one of ``archived``, ``already-archived``, ``would-archive``
-        (dry-run), ``verify-failed`` or ``error: ...``.
+        captures the mirror action, with ``+local-pruned`` appended when an old
+        verified local file was removed.
         """
         if not self.source_root.exists():
             logger.warning("Source root %s does not exist; nothing to archive", self.source_root)
@@ -233,11 +297,6 @@ class NasArchiver:
         for src in sorted(self.source_root.rglob("*")):
             if not src.is_file():
                 continue
-            try:
-                if not self._is_old(src, cutoff):
-                    continue
-            except OSError:
-                continue
 
             rel = src.relative_to(self.source_root)
             dest = self.dest_root / rel
@@ -247,9 +306,25 @@ class NasArchiver:
                 size = None
 
             try:
-                status = self._archive_file(src, dest, dry_run)
+                status = self._mirror_file(src, dest, dry_run)
+                try:
+                    is_old = self._is_old(src, cutoff)
+                except OSError:
+                    is_old = False
+                if is_old and status not in ("verify-failed",):
+                    if dry_run and status in (
+                        "would-copy",
+                        "would-replace",
+                        "would-backup-and-replace",
+                        "up-to-date",
+                    ):
+                        prune_status = "would-prune-local"
+                    else:
+                        prune_status = self._prune_local_file(src, dest, dry_run)
+                    if prune_status is not None:
+                        status = f"{status}+{prune_status}"
             except Exception as exc:  # noqa: BLE001 — log and keep going
-                logger.exception("Failed to archive %s", src)
+                logger.exception("Failed to mirror %s", src)
                 status = f"error: {exc}"
 
             rows.append(
@@ -261,18 +336,21 @@ class NasArchiver:
                     "status": status,
                 }
             )
-            if status in ("archived", "already-archived"):
-                logger.info("%s -> %s (%s)", rel, dest, status)
+            logger.info("%s -> %s (%s)", rel, dest, status)
 
         if not dry_run:
             self._prune_empty_dirs()
 
         df = pd.DataFrame(rows, columns=MANIFEST_COLUMNS)
-        moved = int((df["status"].isin(["archived", "already-archived"])).sum()) if not df.empty else 0
+        mirrored = int(
+            df["status"].str.contains("copied|replaced", regex=True).sum()
+        ) if not df.empty else 0
+        pruned = int(df["status"].str.contains("local-pruned", regex=False).sum()) if not df.empty else 0
         logger.info(
-            "Archive pass complete: %d candidate(s), %d moved, cutoff < %s",
+            "Archive pass complete: %d file(s), %d mirrored, %d local pruned, cutoff < %s",
             len(df),
-            moved,
+            mirrored,
+            pruned,
             cutoff,
         )
         return df
